@@ -18,13 +18,31 @@ import asyncio
 import csv
 import dataclasses
 import datetime as dt
-import math
 import os
 import signal
 import sys
+import time
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import ccxt.async_support as ccxt
+
+
+def _env_bool(name: str, default: str) -> bool:
+    return os.getenv(name, default).lower() in {"1", "true", "yes", "y"}
+
+
+def _env_csv(name: str, default: str) -> Tuple[str, ...]:
+    raw = os.getenv(name, default)
+    return tuple(token.strip().upper() for token in raw.split(",") if token.strip())
+
+
+def _safe_float(value) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 @dataclasses.dataclass
@@ -42,14 +60,32 @@ class BotConfig:
     maker_fee: float = float(os.getenv("MAKER_FEE", "0.001"))
 
     min_profit_threshold: float = float(os.getenv("MIN_PROFIT_THRESHOLD", "0.002"))  # 0.2%
+    profit_safety_buffer: float = float(os.getenv("PROFIT_SAFETY_BUFFER", "0.0005"))
     max_orderbook_symbols_per_scan: int = int(os.getenv("MAX_ORDERBOOK_SYMBOLS_PER_SCAN", "240"))
     orderbook_depth_limit: int = int(os.getenv("ORDERBOOK_DEPTH_LIMIT", "25"))
+    max_cycles_per_scan: int = int(os.getenv("MAX_CYCLES_PER_SCAN", "900"))
 
     top_liquidity_count: int = int(os.getenv("TOP_LIQUIDITY_COUNT", "200"))
     top_volatility_count: int = int(os.getenv("TOP_VOLATILITY_COUNT", "120"))
+    min_symbol_quote_volume: float = float(os.getenv("MIN_SYMBOL_QUOTE_VOLUME", "500000"))
+    allowed_quote_assets: Tuple[str, ...] = dataclasses.field(
+        default_factory=lambda: _env_csv(
+            "ALLOWED_QUOTE_ASSETS",
+            "USDT,USDC,FDUSD,BUSD,BTC,ETH,BNB",
+        )
+    )
+    allowed_intermediate_assets: Tuple[str, ...] = dataclasses.field(
+        default_factory=lambda: _env_csv("ALLOWED_INTERMEDIATE_ASSETS", "")
+    )
 
     scan_interval_seconds: float = float(os.getenv("SCAN_INTERVAL_SECONDS", "6"))
-    dry_run: bool = os.getenv("DRY_RUN", "true").lower() in {"1", "true", "yes", "y"}
+    dry_run: bool = _env_bool("DRY_RUN", "true")
+    run_seconds: float = float(os.getenv("RUN_SECONDS", "0"))
+    log_all_evaluations: bool = _env_bool("LOG_ALL_EVALUATIONS", "false")
+
+    max_leg_spread_pct: float = float(os.getenv("MAX_LEG_SPREAD_PCT", "0.0018"))
+    max_leg_impact_pct: float = float(os.getenv("MAX_LEG_IMPACT_PCT", "0.0015"))
+    slippage_safety_buffer: float = float(os.getenv("SLIPPAGE_SAFETY_BUFFER", "0.0004"))
 
     max_consecutive_losses: int = 3
     csv_log_path: str = os.getenv("CSV_LOG_PATH", "arb_log.csv")
@@ -71,6 +107,14 @@ class CycleEvaluation:
     expected_profit_pct: float
     status: str
     error: str = ""
+
+
+@dataclasses.dataclass
+class FillSimulation:
+    received: float
+    top_price: float
+    avg_price: float
+    impact_pct: float
 
 
 class TriangularArbitrageBot:
@@ -127,6 +171,8 @@ class TriangularArbitrageBot:
 
     def _build_directed_edges(self):
         edges_by_src: Dict[str, List[DirectedEdge]] = {}
+        allowed_quotes = set(self.cfg.allowed_quote_assets)
+        allowed_quotes.add(self.cfg.start_asset.upper())
         for symbol, market in self.markets.items():
             if not market.get("active", True):
                 continue
@@ -135,6 +181,8 @@ class TriangularArbitrageBot:
 
             base = market["base"]
             quote = market["quote"]
+            if str(quote).upper() not in allowed_quotes:
+                continue
 
             # base -> quote uses SELL
             edges_by_src.setdefault(base, []).append(
@@ -149,11 +197,26 @@ class TriangularArbitrageBot:
 
     async def run(self):
         loop = asyncio.get_event_loop()
-        loop.add_signal_handler(signal.SIGINT, self.stop)
-        loop.add_signal_handler(signal.SIGTERM, self.stop)
+        try:
+            loop.add_signal_handler(signal.SIGINT, self.stop)
+            loop.add_signal_handler(signal.SIGTERM, self.stop)
+        except NotImplementedError:
+            # Some platforms (notably Windows) don't support these handlers.
+            pass
 
-        print(f"[INFO] Bot started on {self.cfg.exchange_id}. dry_run={self.cfg.dry_run}")
+        deadline_monotonic: Optional[float] = None
+        if self.cfg.run_seconds > 0:
+            deadline_monotonic = time.monotonic() + self.cfg.run_seconds
+
+        print(
+            f"[INFO] Bot started on {self.cfg.exchange_id}. "
+            f"dry_run={self.cfg.dry_run} run_seconds={self.cfg.run_seconds}"
+        )
         while self._running:
+            if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+                print("[INFO] Run window reached. Stopping bot.")
+                self.stop()
+                break
             try:
                 await self.scan_once()
             except Exception as exc:
@@ -170,9 +233,11 @@ class TriangularArbitrageBot:
         cycles = self._find_candidate_cycles(selected_assets)
         if not cycles:
             return
+        cycles = self._prioritize_cycles(cycles, tickers)
 
-        symbols = sorted({edge.symbol for _, edges in cycles for edge in edges})
-        symbols = symbols[: self.cfg.max_orderbook_symbols_per_scan]
+        symbols = self._select_orderbook_symbols(cycles, tickers)
+        if not symbols:
+            return
         orderbooks = await self._fetch_orderbooks(symbols)
 
         best: Optional[CycleEvaluation] = None
@@ -180,10 +245,12 @@ class TriangularArbitrageBot:
             if any(e.symbol not in orderbooks for e in edges):
                 continue
             ev = self._evaluate_cycle(cycle_assets, edges, orderbooks)
-            self._log_attempt(ev, realized_final=None)
+            if self.cfg.log_all_evaluations:
+                self._log_attempt(ev, realized_final=None)
             if ev.status != "ok":
                 continue
-            if ev.expected_profit_pct < self.cfg.min_profit_threshold:
+            required_profit = self.cfg.min_profit_threshold + self.cfg.profit_safety_buffer
+            if ev.expected_profit_pct < required_profit:
                 continue
             if best is None or ev.expected_profit_pct > best.expected_profit_pct:
                 best = ev
@@ -194,6 +261,7 @@ class TriangularArbitrageBot:
         print(
             f"[INFO] candidate {best.cycle_assets} exp={best.expected_profit_pct*100:.3f}%"
         )
+        self._log_attempt(best, realized_final=None, status_override="selected")
         await self._execute_cycle(best, orderbooks)
 
     def _select_assets(self, tickers: Dict[str, dict]) -> set[str]:
@@ -204,13 +272,15 @@ class TriangularArbitrageBot:
             market = self.markets.get(symbol)
             if not market or market.get("spot") is False:
                 continue
+            quote = str(market.get("quote", "")).upper()
+            if quote not in self.cfg.allowed_quote_assets:
+                continue
 
             volume = float(t.get("quoteVolume") or 0.0)
-            if volume <= 0:
+            if volume < self.cfg.min_symbol_quote_volume:
                 continue
             pct = abs(float(t.get("percentage") or 0.0))
             base = market["base"]
-            quote = market["quote"]
             rows.append((symbol, base, quote, volume, pct))
 
         rows.sort(key=lambda x: x[3], reverse=True)
@@ -224,23 +294,62 @@ class TriangularArbitrageBot:
             assets.add(quote)
         return assets
 
+    @staticmethod
+    def _ticker_volume(ticker: dict) -> float:
+        return float((ticker or {}).get("quoteVolume") or 0.0)
+
+    def _prioritize_cycles(
+        self,
+        cycles: List[Tuple[Tuple[str, str, str, str], Tuple[DirectedEdge, DirectedEdge, DirectedEdge]]],
+        tickers: Dict[str, dict],
+    ) -> List[Tuple[Tuple[str, str, str, str], Tuple[DirectedEdge, DirectedEdge, DirectedEdge]]]:
+        scored = []
+        for cycle_assets, edges in cycles:
+            score = 0.0
+            for edge in edges:
+                score += self._ticker_volume(tickers.get(edge.symbol, {}))
+            scored.append((score, cycle_assets, edges))
+
+        scored.sort(key=lambda item: item[0], reverse=True)
+        limited = scored[: self.cfg.max_cycles_per_scan]
+        return [(cycle_assets, edges) for _, cycle_assets, edges in limited]
+
+    def _select_orderbook_symbols(
+        self,
+        cycles: List[Tuple[Tuple[str, str, str, str], Tuple[DirectedEdge, DirectedEdge, DirectedEdge]]],
+        tickers: Dict[str, dict],
+    ) -> List[str]:
+        scores: Dict[str, float] = {}
+        for _, edges in cycles:
+            for edge in edges:
+                scores.setdefault(edge.symbol, 0.0)
+                scores[edge.symbol] += self._ticker_volume(tickers.get(edge.symbol, {}))
+
+        ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+        return [symbol for symbol, _ in ranked[: self.cfg.max_orderbook_symbols_per_scan]]
+
     def _find_candidate_cycles(
         self, selected_assets: set[str]
     ) -> List[Tuple[Tuple[str, str, str, str], Tuple[DirectedEdge, DirectedEdge, DirectedEdge]]]:
         start = self.cfg.start_asset
         cycles = []
         seen = set()
+        allowed_intermediates = {a.upper() for a in self.cfg.allowed_intermediate_assets}
 
         for e1 in self.edges_by_src.get(start, []):
             if e1.dst not in selected_assets:
                 continue
+            if allowed_intermediates and e1.dst.upper() not in allowed_intermediates:
+                continue
             for e2 in self.edges_by_src.get(e1.dst, []):
                 if e2.dst not in selected_assets or e2.dst == start:
+                    continue
+                if allowed_intermediates and e2.dst.upper() not in allowed_intermediates:
                     continue
                 for e3 in self.edges_by_src.get(e2.dst, []):
                     if e3.dst != start:
                         continue
-                    if not (e1.symbol != e2.symbol != e3.symbol):
+                    if len({e1.symbol, e2.symbol, e3.symbol}) != 3:
                         continue
                     cycle_assets = (start, e1.dst, e2.dst, start)
                     cycle_key = (cycle_assets, tuple(sorted([e1.symbol, e2.symbol, e3.symbol])))
@@ -273,29 +382,77 @@ class TriangularArbitrageBot:
             if not book:
                 return CycleEvaluation(cycle_assets, edges, amount, -1.0, "error", "missing orderbook")
 
-            if edge.side == "buy":
-                received = self._simulate_buy_with_quote(amount, book.get("asks") or [])
-            else:
-                received = self._simulate_sell_base(amount, book.get("bids") or [])
+            spread = self._top_spread_pct(book)
+            if spread is None:
+                return CycleEvaluation(cycle_assets, edges, amount, -1.0, "error", f"invalid orderbook {edge.symbol}")
+            if spread > self.cfg.max_leg_spread_pct:
+                return CycleEvaluation(
+                    cycle_assets,
+                    edges,
+                    amount,
+                    -1.0,
+                    "error",
+                    f"spread_too_wide {edge.symbol} {spread:.6f}",
+                )
 
-            if received is None or received <= 0:
+            fill = self._simulate_edge_fill(edge, amount, book)
+            if fill is None or fill.received <= 0:
                 return CycleEvaluation(cycle_assets, edges, amount, -1.0, "error", f"insufficient depth {edge.symbol}")
 
-            amount = received * (1.0 - self.cfg.taker_fee)
+            if fill.impact_pct > self.cfg.max_leg_impact_pct:
+                return CycleEvaluation(
+                    cycle_assets,
+                    edges,
+                    amount,
+                    -1.0,
+                    "error",
+                    f"impact_too_high {edge.symbol} {fill.impact_pct:.6f}",
+                )
+
+            market = self.markets.get(edge.symbol, {})
+            limit_error = self._validate_market_limits(market, edge.side, amount, fill.received)
+            if limit_error:
+                return CycleEvaluation(cycle_assets, edges, amount, -1.0, "error", f"{limit_error} {edge.symbol}")
+
+            amount = fill.received * (1.0 - self.cfg.taker_fee) * (1.0 - self.cfg.slippage_safety_buffer)
 
         profit_pct = (amount / self.cfg.start_amount) - 1.0
         return CycleEvaluation(cycle_assets, edges, amount, profit_pct, "ok")
 
     @staticmethod
-    def _simulate_buy_with_quote(quote_amount: float, asks: Sequence[Sequence[float]]) -> Optional[float]:
+    def _top_spread_pct(book: dict) -> Optional[float]:
+        bids = book.get("bids") or []
+        asks = book.get("asks") or []
+        if not bids or not asks:
+            return None
+
+        best_bid = _safe_float(bids[0][0] if len(bids[0]) >= 1 else None)
+        best_ask = _safe_float(asks[0][0] if len(asks[0]) >= 1 else None)
+        if best_bid is None or best_ask is None or best_bid <= 0 or best_ask <= 0 or best_bid >= best_ask:
+            return None
+        return (best_ask - best_bid) / best_ask
+
+    def _simulate_edge_fill(self, edge: DirectedEdge, amount: float, book: dict) -> Optional[FillSimulation]:
+        if edge.side == "buy":
+            return self._simulate_buy_with_quote_details(amount, book.get("asks") or [])
+        return self._simulate_sell_base_details(amount, book.get("bids") or [])
+
+    @staticmethod
+    def _simulate_buy_with_quote_details(
+        quote_amount: float, asks: Sequence[Sequence[float]]
+    ) -> Optional[FillSimulation]:
         remaining_quote = quote_amount
         base_bought = 0.0
+        top_price: Optional[float] = None
+
         for ask in asks:
             if len(ask) < 2:
                 continue
             price, qty_base = float(ask[0]), float(ask[1])
             if price <= 0 or qty_base <= 0:
                 continue
+            if top_price is None:
+                top_price = price
             max_quote_here = price * qty_base
             spend = min(remaining_quote, max_quote_here)
             base_bought += spend / price
@@ -303,29 +460,101 @@ class TriangularArbitrageBot:
             if remaining_quote <= 1e-12:
                 break
 
-        if remaining_quote > 1e-9:
+        spent = quote_amount - max(remaining_quote, 0.0)
+        if remaining_quote > 1e-9 or base_bought <= 0 or top_price is None:
             return None
-        return base_bought
+
+        avg_price = spent / base_bought
+        impact_pct = (avg_price / top_price) - 1.0
+        return FillSimulation(received=base_bought, top_price=top_price, avg_price=avg_price, impact_pct=impact_pct)
 
     @staticmethod
-    def _simulate_sell_base(base_amount: float, bids: Sequence[Sequence[float]]) -> Optional[float]:
+    def _simulate_buy_with_quote(quote_amount: float, asks: Sequence[Sequence[float]]) -> Optional[float]:
+        details = TriangularArbitrageBot._simulate_buy_with_quote_details(quote_amount, asks)
+        if details is None:
+            return None
+        return details.received
+
+    @staticmethod
+    def _simulate_sell_base_details(base_amount: float, bids: Sequence[Sequence[float]]) -> Optional[FillSimulation]:
         remaining_base = base_amount
         quote_gained = 0.0
+        top_price: Optional[float] = None
+
         for bid in bids:
             if len(bid) < 2:
                 continue
             price, qty_base = float(bid[0]), float(bid[1])
             if price <= 0 or qty_base <= 0:
                 continue
+            if top_price is None:
+                top_price = price
             sold = min(remaining_base, qty_base)
             quote_gained += sold * price
             remaining_base -= sold
             if remaining_base <= 1e-12:
                 break
 
-        if remaining_base > 1e-9:
+        sold_total = base_amount - max(remaining_base, 0.0)
+        if remaining_base > 1e-9 or sold_total <= 0 or top_price is None:
             return None
-        return quote_gained
+
+        avg_price = quote_gained / sold_total
+        impact_pct = 1.0 - (avg_price / top_price)
+        return FillSimulation(received=quote_gained, top_price=top_price, avg_price=avg_price, impact_pct=impact_pct)
+
+    @staticmethod
+    def _simulate_sell_base(base_amount: float, bids: Sequence[Sequence[float]]) -> Optional[float]:
+        details = TriangularArbitrageBot._simulate_sell_base_details(base_amount, bids)
+        if details is None:
+            return None
+        return details.received
+
+    @staticmethod
+    def _check_min_max(
+        value: float,
+        min_value: Optional[float],
+        max_value: Optional[float],
+        what: str,
+    ) -> Optional[str]:
+        if min_value is not None and value + 1e-12 < min_value:
+            return f"below_min_{what}"
+        if max_value is not None and value - 1e-12 > max_value:
+            return f"above_max_{what}"
+        return None
+
+    def _validate_market_limits(
+        self,
+        market: dict,
+        side: str,
+        requested_amount_in: float,
+        received_amount_out: float,
+    ) -> str:
+        limits = market.get("limits") or {}
+        amount_limits = limits.get("amount") or {}
+        cost_limits = limits.get("cost") or {}
+
+        min_amount = _safe_float(amount_limits.get("min"))
+        max_amount = _safe_float(amount_limits.get("max"))
+        min_cost = _safe_float(cost_limits.get("min"))
+        max_cost = _safe_float(cost_limits.get("max"))
+
+        if side == "buy":
+            # We buy base using quote budget.
+            base_amount = received_amount_out
+            quote_cost = requested_amount_in
+        else:
+            base_amount = requested_amount_in
+            quote_cost = received_amount_out
+
+        amount_error = self._check_min_max(base_amount, min_amount, max_amount, "amount")
+        if amount_error:
+            return amount_error
+
+        cost_error = self._check_min_max(quote_cost, min_cost, max_cost, "cost")
+        if cost_error:
+            return cost_error
+        return ""
 
     async def _execute_cycle(self, evaluation: CycleEvaluation, orderbooks: Dict[str, dict]):
         if self.cfg.dry_run:
@@ -349,6 +578,12 @@ class TriangularArbitrageBot:
             for edge in evaluation.edges:
                 market = self.markets[edge.symbol]
                 if edge.side == "sell":
+                    est_quote = self._simulate_sell_base(cur_amount, (orderbooks[edge.symbol].get("bids") or []))
+                    if est_quote is None:
+                        raise RuntimeError(f"No depth for sell {edge.symbol}")
+                    limit_error = self._validate_market_limits(market, edge.side, cur_amount, est_quote)
+                    if limit_error:
+                        raise RuntimeError(f"{limit_error} {edge.symbol}")
                     amount = self.exchange.amount_to_precision(edge.symbol, cur_amount)
                     order = await self.exchange.create_order(edge.symbol, "market", "sell", amount)
                     cur_amount = self._extract_received_quote(order, market)
@@ -357,6 +592,9 @@ class TriangularArbitrageBot:
                     est_base = self._simulate_buy_with_quote(cur_amount, (orderbooks[edge.symbol].get("asks") or []))
                     if est_base is None:
                         raise RuntimeError(f"No depth for buy {edge.symbol}")
+                    limit_error = self._validate_market_limits(market, edge.side, cur_amount, est_base)
+                    if limit_error:
+                        raise RuntimeError(f"{limit_error} {edge.symbol}")
                     amount = self.exchange.amount_to_precision(edge.symbol, est_base)
                     order = await self.exchange.create_order(edge.symbol, "market", "buy", amount)
                     cur_amount = self._extract_received_base(order, market)
@@ -419,7 +657,7 @@ class TriangularArbitrageBot:
             realized_profit_pct = (realized_final / self.cfg.start_amount) - 1.0
 
         row = [
-            dt.datetime.utcnow().isoformat(),
+            dt.datetime.now(dt.UTC).isoformat(),
             "dry_run" if self.cfg.dry_run else "live",
             status,
             " -> ".join(evaluation.cycle_assets),
