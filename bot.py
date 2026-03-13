@@ -23,6 +23,9 @@ import time
 from typing import Optional, Sequence
 
 import ccxt.async_support as ccxt
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
 def _env_bool(name: str, default: str) -> bool:
