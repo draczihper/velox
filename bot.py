@@ -41,7 +41,7 @@ def _safe_float(value, default: float = 0.0) -> float:
 
 @dataclasses.dataclass
 class BotConfig:
-    exchange_id: str = os.getenv("EXCHANGE_ID", "binance")
+    exchange_id: str = os.getenv("EXCHANGE_ID", "kucoin")
     api_key: str = os.getenv("EXCHANGE_API_KEY", "")
     api_secret: str = os.getenv("EXCHANGE_API_SECRET", "")
     api_password: str = os.getenv("EXCHANGE_API_PASSWORD", "")
@@ -68,6 +68,7 @@ class BotConfig:
     cooldown_bars_after_exit: int = int(os.getenv("COOLDOWN_BARS_AFTER_EXIT", "2"))
     run_seconds: float = float(os.getenv("RUN_SECONDS", "0"))
     dry_run: bool = _env_bool("DRY_RUN", "true")
+    health_check: bool = _env_bool("HEALTH_CHECK", "true")
 
     csv_log_path: str = os.getenv("CSV_LOG_PATH", "bot_log.csv")
 
@@ -144,13 +145,32 @@ class AdaptiveSpotBot:
 
     async def initialize(self):
         self._ensure_log_file()
-        await self.exchange.load_markets()
+        if self.cfg.health_check:
+            await self._health_check()
+        else:
+            await self.exchange.load_markets()
 
     def _ensure_log_file(self):
         if os.path.exists(self.cfg.csv_log_path):
             return
         with open(self.cfg.csv_log_path, "w", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow(self.log_header)
+
+    async def _health_check(self):
+        print(f"[INFO] Health check: {self.cfg.exchange_id}")
+        try:
+            status = await self.exchange.fetch_status()
+            status_value = status.get("status") if isinstance(status, dict) else status
+            print(f"[INFO] fetch_status OK: {status_value}")
+        except Exception as exc:
+            print(f"[WARN] fetch_status failed: {exc}")
+
+        try:
+            await self.exchange.load_markets()
+            print(f"[INFO] load_markets OK: {len(self.exchange.markets)} symbols")
+        except Exception as exc:
+            print(f"[ERROR] load_markets failed: {exc}")
+            raise
 
     async def run(self):
         loop = asyncio.get_event_loop()

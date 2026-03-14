@@ -399,7 +399,7 @@ def _print_results(results: Iterable[BacktestResult]):
 
 def main():
     parser = argparse.ArgumentParser(description="Backtest spot strategies on exchange OHLCV data")
-    parser.add_argument("--exchange", default="binance", help="CCXT exchange id")
+    parser.add_argument("--exchange", default="kucoin", help="CCXT exchange id")
     parser.add_argument("--symbol", default="BTC/USDT", help="Trading pair symbol")
     parser.add_argument("--timeframe", default="15m", help="OHLCV timeframe (e.g. 5m, 15m, 1h)")
     parser.add_argument("--lookback-days", type=int, default=45, help="Historical window in days")
