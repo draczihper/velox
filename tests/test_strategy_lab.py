@@ -7,7 +7,9 @@ from strategy_lab import (
     Candle,
     _signals_ema_trend,
     _signals_rsi_mean_reversion,
+    _signals_hybrid_regime,
     _timeframe_seconds,
+    optimize_hybrid_strategy,
     run_backtest,
 )
 
@@ -70,3 +72,31 @@ def test_rsi_reversion_triggers_after_drop():
     closes = [100.0] * 40 + [95.0, 92.0, 89.0, 87.0, 90.0, 92.0, 94.0]
     entries, exits = _signals_rsi_mean_reversion(closes)
     assert any(entries)
+
+
+def test_hybrid_signal_shapes():
+    closes = [100 + ((i % 10) - 5) * 0.4 + i * 0.05 for i in range(180)]
+    entries, exits = _signals_hybrid_regime(
+        closes=closes,
+        fast_period=12,
+        slow_period=55,
+        rsi_entry=36.0,
+        rsi_exit=65.0,
+        breakout_lookback=20,
+    )
+    assert len(entries) == len(closes)
+    assert len(exits) == len(closes)
+
+
+def test_optimize_hybrid_returns_result():
+    closes = [100 + i * 0.15 + ((i % 12) - 6) * 0.25 for i in range(260)]
+    candles = _make_candles(closes)
+    result = optimize_hybrid_strategy(
+        candles=candles,
+        start_cash=1000.0,
+        fee_rate=0.0005,
+        slippage_rate=0.0,
+        periods_per_year=365.0,
+    )
+    assert result.name.startswith("hybrid_opt_")
+    assert result.trades >= 0

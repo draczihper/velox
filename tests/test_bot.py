@@ -30,7 +30,7 @@ def make_bot(monkeypatch):
 def test_decide_buy_on_trend(make_bot):
     bot = make_bot()
     action, reason = bot._decide(
-        SignalSnapshot(last_price=100.0, ema_fast=101.0, ema_slow=99.0, rsi=50.0, volatility=0.01)
+        SignalSnapshot(last_price=100.0, ema_fast=101.0, ema_slow=99.0, ema_confirm_fast=110.0, ema_confirm_slow=100.0, rsi=50.0, volatility=0.01, breakout_bias=-0.002, trend_gap=0.02, confirm_trend_gap=0.03)
     )
     assert action == "buy"
     assert reason == "trend_continuation"
@@ -41,7 +41,7 @@ def test_decide_sell_on_hard_stop(make_bot):
     bot.position = PositionState(base_qty=0.1, entry_price=100.0, peak_price=102.0)
 
     action, reason = bot._decide(
-        SignalSnapshot(last_price=98.5, ema_fast=99.0, ema_slow=100.0, rsi=45.0, volatility=0.02)
+        SignalSnapshot(last_price=98.5, ema_fast=99.0, ema_slow=100.0, ema_confirm_fast=101.0, ema_confirm_slow=100.0, rsi=45.0, volatility=0.02, breakout_bias=-0.01, trend_gap=-0.01, confirm_trend_gap=0.01)
     )
     assert action == "sell"
     assert reason == "hard_stop"
@@ -89,7 +89,7 @@ def test_decide_honors_cooldown(make_bot):
     bot = make_bot(cooldown_bars_after_exit=3)
     bot.bars_since_exit = 1
     action, reason = bot._decide(
-        SignalSnapshot(last_price=100.0, ema_fast=101.0, ema_slow=99.0, rsi=50.0, volatility=0.01)
+        SignalSnapshot(last_price=100.0, ema_fast=101.0, ema_slow=99.0, ema_confirm_fast=110.0, ema_confirm_slow=100.0, rsi=50.0, volatility=0.01, breakout_bias=-0.002, trend_gap=0.02, confirm_trend_gap=0.03)
     )
     assert action == "hold"
     assert reason == "cooldown"
@@ -104,3 +104,45 @@ def test_invalid_config_rejected(monkeypatch):
 def test_available_quote_balance_dry_run(make_bot):
     bot = make_bot(dry_run=True, starting_capital_quote=11.0)
     assert asyncio.run(bot._available_quote_balance()) == 11.0
+
+
+def test_decide_breakout_pullback_entry(make_bot):
+    bot = make_bot()
+    action, reason = bot._decide(
+        SignalSnapshot(
+            last_price=100.0,
+            ema_fast=101.0,
+            ema_slow=100.0,
+            ema_confirm_fast=110.0,
+            ema_confirm_slow=107.0,
+            rsi=63.0,
+            volatility=0.01,
+            breakout_bias=-0.0005,
+            trend_gap=0.01,
+            confirm_trend_gap=0.02,
+        )
+    )
+    assert action == "buy"
+    assert reason == "breakout_pullback"
+
+
+def test_decide_sell_when_higher_timeframe_lost(make_bot):
+    bot = make_bot()
+    bot.position = PositionState(base_qty=0.1, entry_price=100.0, peak_price=101.0)
+
+    action, reason = bot._decide(
+        SignalSnapshot(
+            last_price=100.8,
+            ema_fast=101.0,
+            ema_slow=100.0,
+            ema_confirm_fast=99.0,
+            ema_confirm_slow=100.0,
+            rsi=45.0,
+            volatility=0.01,
+            breakout_bias=-0.002,
+            trend_gap=0.01,
+            confirm_trend_gap=-0.01,
+        )
+    )
+    assert action == "sell"
+    assert reason == "higher_timeframe_lost"
