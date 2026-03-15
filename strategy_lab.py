@@ -9,7 +9,9 @@ long-only strategy variants by return and risk metrics.
 from __future__ import annotations
 
 import argparse
+import csv
 import dataclasses
+import datetime as dt
 import math
 import statistics
 import time
@@ -370,6 +372,34 @@ def fetch_candles(
     return candles
 
 
+def load_candles_from_csv(path: str) -> List[Candle]:
+    candles: List[Candle] = []
+    with open(path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f, delimiter=";")
+        for row in reader:
+            ts_raw = (row.get("time") or row.get("\ufefftime") or "").strip().strip("\"")
+            if not ts_raw:
+                continue
+            ts = dt.datetime.fromisoformat(ts_raw)
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=dt.timezone.utc)
+            ts_ms = int(ts.timestamp() * 1000)
+            try:
+                candles.append(
+                    Candle(
+                        timestamp_ms=ts_ms,
+                        open=float(row["open"]),
+                        high=float(row["high"]),
+                        low=float(row["low"]),
+                        close=float(row["close"]),
+                        volume=0.0,
+                    )
+                )
+            except (KeyError, ValueError):
+                continue
+    return candles
+
+
 def _print_results(results: Iterable[BacktestResult]):
     header = (
         f"{'strategy':<24}"
@@ -488,6 +518,7 @@ def main():
     parser.add_argument("--exchange", default="kucoin", help="CCXT exchange id")
     parser.add_argument("--symbol", default="BTC/USDT", help="Trading pair symbol")
     parser.add_argument("--timeframe", default="15m", help="OHLCV timeframe (e.g. 5m, 15m, 1h)")
+    parser.add_argument("--csv", help="Path to CSV with time,open,high,low,close columns (semicolon-delimited)")
     parser.add_argument("--lookback-days", type=int, default=45, help="Historical window in days")
     parser.add_argument("--max-bars", type=int, default=3000, help="Maximum bars to fetch")
     parser.add_argument("--start-cash", type=float, default=1000.0, help="Starting balance in quote currency")
@@ -495,6 +526,49 @@ def main():
     parser.add_argument("--slippage-rate", type=float, default=0.0002, help="Execution slippage per side")
     parser.add_argument("--optimize-hybrid", action="store_true", help="Run parameter search for hybrid regime strategy")
     args = parser.parse_args()
+
+    if args.csv:
+        candles = load_candles_from_csv(args.csv)
+        if len(candles) < 60:
+            raise SystemExit("Not enough candles loaded for comparison (need at least 60)")
+        if len(candles) < 120:
+            print(f"[WARN] Only {len(candles)} candles loaded; results may be noisy.")
+        closes = [c.close for c in candles]
+        bar_seconds = _timeframe_seconds(args.timeframe)
+        periods_per_year = (365.0 * 24.0 * 3600.0) / bar_seconds
+        strategy_defs = [
+            ("ema_trend_pullback", _signals_ema_trend(closes)),
+            ("rsi_mean_reversion", _signals_rsi_mean_reversion(closes)),
+            ("bollinger_reversion", _signals_bollinger_reversion(closes)),
+        ]
+        results = []
+        for name, (entries, exits) in strategy_defs:
+            results.append(
+                run_backtest(
+                    name=name,
+                    candles=candles,
+                    entries=entries,
+                    exits=exits,
+                    start_cash=args.start_cash,
+                    fee_rate=args.fee_rate,
+                    slippage_rate=args.slippage_rate,
+                    periods_per_year=periods_per_year,
+                )
+            )
+        if args.optimize_hybrid:
+            results.append(
+                optimize_hybrid_strategy(
+                    candles=candles,
+                    start_cash=args.start_cash,
+                    fee_rate=args.fee_rate,
+                    slippage_rate=args.slippage_rate,
+                    periods_per_year=periods_per_year,
+                )
+            )
+        results.sort(key=lambda x: x.stability_score, reverse=True)
+        print(f"Source=CSV Path={args.csv} Timeframe={args.timeframe} Candles={len(candles)}")
+        _print_results(results)
+        return
 
     if not hasattr(ccxt, args.exchange):
         raise SystemExit(f"Unsupported exchange '{args.exchange}'")

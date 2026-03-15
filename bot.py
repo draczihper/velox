@@ -67,6 +67,13 @@ class BotConfig:
     min_volatility: float = float(os.getenv("MIN_VOLATILITY", "0.0015"))
     max_volatility: float = float(os.getenv("MAX_VOLATILITY", "0.03"))
     min_confirm_trend_gap: float = float(os.getenv("MIN_CONFIRM_TREND_GAP", "0.0005"))
+    rsi_trend_entry_max: float = float(os.getenv("RSI_TREND_ENTRY_MAX", "62"))
+    rsi_oversold: float = float(os.getenv("RSI_OVERSOLD", "38"))
+    rsi_overbought: float = float(os.getenv("RSI_OVERBOUGHT", "67"))
+    rsi_breakout_max: float = float(os.getenv("RSI_BREAKOUT_MAX", "74"))
+    rsi_trend_exit_min: float = float(os.getenv("RSI_TREND_EXIT_MIN", "52"))
+    volatility_max_mean_reversion: float = float(os.getenv("VOLATILITY_MAX_MEAN_REVERSION", "0.02"))
+    volatility_spike_multiplier: float = float(os.getenv("VOLATILITY_SPIKE_MULTIPLIER", "1.5"))
 
     scan_interval_seconds: float = float(os.getenv("SCAN_INTERVAL_SECONDS", "20"))
     cooldown_bars_after_exit: int = int(os.getenv("COOLDOWN_BARS_AFTER_EXIT", "2"))
@@ -77,6 +84,10 @@ class BotConfig:
     csv_log_path: str = os.getenv("CSV_LOG_PATH", "bot_log.csv")
     log_every_n_scans: int = int(os.getenv("LOG_EVERY_N_SCANS", "0"))
     log_every_seconds: float = float(os.getenv("LOG_EVERY_SECONDS", "0"))
+    force_threaded_resolver: bool = _env_bool("FORCE_THREADED_RESOLVER", "false")
+    log_hold_each_scan: bool = _env_bool("LOG_HOLD_EACH_SCAN", "false")
+    log_diagnostics: bool = _env_bool("LOG_DIAGNOSTICS", "false")
+    diagnostic_log_path: str = os.getenv("DIAGNOSTIC_LOG_PATH", "bot_diag.csv")
 
 
 @dataclasses.dataclass
@@ -116,6 +127,7 @@ class AdaptiveSpotBot:
         self._last_snapshot: Optional[SignalSnapshot] = None
         self._last_equity = cfg.starting_capital_quote
         self._heartbeat_task: Optional[asyncio.Task] = None
+        self._last_diag: Optional[dict[str, float | int | str]] = None
 
         self.log_header = [
             "timestamp_utc",
@@ -128,6 +140,29 @@ class AdaptiveSpotBot:
             "quote_spent_or_received",
             "equity_quote",
             "drawdown_pct",
+        ]
+        self.diag_header = [
+            "timestamp_utc",
+            "symbol",
+            "price",
+            "ema_fast",
+            "ema_slow",
+            "ema_confirm_fast",
+            "ema_confirm_slow",
+            "rsi",
+            "volatility",
+            "breakout_bias",
+            "trend_gap",
+            "confirm_trend_gap",
+            "trend_up",
+            "confirm_trend_up",
+            "regime_ok",
+            "confirm_strength_ok",
+            "oversold",
+            "overbought",
+            "breakout_ready",
+            "action",
+            "reason",
         ]
 
     def _validate_config(self):
@@ -145,6 +180,19 @@ class AdaptiveSpotBot:
             raise ValueError("MAX_CONSECUTIVE_LOSSES must be >= 1")
         if self.cfg.min_volatility < 0 or self.cfg.max_volatility <= self.cfg.min_volatility:
             raise ValueError("Volatility bounds must satisfy 0 <= MIN_VOLATILITY < MAX_VOLATILITY")
+        for name, value in (
+            ("RSI_TREND_ENTRY_MAX", self.cfg.rsi_trend_entry_max),
+            ("RSI_OVERSOLD", self.cfg.rsi_oversold),
+            ("RSI_OVERBOUGHT", self.cfg.rsi_overbought),
+            ("RSI_BREAKOUT_MAX", self.cfg.rsi_breakout_max),
+            ("RSI_TREND_EXIT_MIN", self.cfg.rsi_trend_exit_min),
+        ):
+            if not (0.0 <= value <= 100.0):
+                raise ValueError(f"{name} must be between 0 and 100")
+        if self.cfg.volatility_max_mean_reversion < 0:
+            raise ValueError("VOLATILITY_MAX_MEAN_REVERSION must be >= 0")
+        if self.cfg.volatility_spike_multiplier <= 0:
+            raise ValueError("VOLATILITY_SPIKE_MULTIPLIER must be > 0")
 
     def _build_exchange(self):
         if not hasattr(ccxt, self.cfg.exchange_id):
@@ -162,6 +210,9 @@ class AdaptiveSpotBot:
 
     async def initialize(self):
         self._ensure_log_file()
+        self._ensure_diag_file()
+        if self.cfg.force_threaded_resolver:
+            await self._configure_threaded_resolver()
         if self.cfg.health_check:
             await self._health_check()
         else:
@@ -174,6 +225,14 @@ class AdaptiveSpotBot:
             return
         with open(self.cfg.csv_log_path, "w", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow(self.log_header)
+
+    def _ensure_diag_file(self):
+        if not self.cfg.log_diagnostics:
+            return
+        if os.path.exists(self.cfg.diagnostic_log_path):
+            return
+        with open(self.cfg.diagnostic_log_path, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(self.diag_header)
 
     async def _health_check(self):
         print(f"[INFO] Health check: {self.cfg.exchange_id}")
@@ -191,11 +250,30 @@ class AdaptiveSpotBot:
             print(f"[ERROR] load_markets failed: {exc}")
             raise
 
+    async def _configure_threaded_resolver(self):
+        # Force aiohttp to use a threaded (system) resolver instead of aiodns.
+        if self.exchange.session is not None:
+            return
+        try:
+            import aiohttp
+            from aiohttp.resolver import ThreadedResolver
+        except Exception as exc:
+            print(f"[WARN] Unable to configure threaded resolver: {exc}")
+            return
+        connector = aiohttp.TCPConnector(resolver=ThreadedResolver(), enable_cleanup_closed=True)
+        self.exchange.tcp_connector = connector
+        self.exchange.session = aiohttp.ClientSession(
+            connector=connector,
+            trust_env=self.exchange.aiohttp_trust_env,
+        )
+
     async def _heartbeat_loop(self):
         while self._running:
             await asyncio.sleep(self.cfg.log_every_seconds)
             if not self._running:
                 break
+            if self.cfg.log_hold_each_scan:
+                continue
             snapshot = self._last_snapshot
             if snapshot is None:
                 continue
@@ -271,6 +349,10 @@ class AdaptiveSpotBot:
         if kill_switch_triggered and self.position.base_qty > 0:
             equity = await self._current_equity(signal_snapshot.last_price)
         self._last_equity = equity
+        if self.cfg.log_diagnostics and self._last_diag:
+            self._log_diagnostics(signal_snapshot, action, reason, self._last_diag)
+        if action == "hold" and self.cfg.log_hold_each_scan and not kill_switch_triggered:
+            self._log("hold", reason, signal_snapshot.last_price, 0.0, 0.0, equity)
         if (
             action == "hold"
             and not kill_switch_triggered
@@ -366,18 +448,27 @@ class AdaptiveSpotBot:
     def _decide(self, s: SignalSnapshot) -> tuple[str, str]:
         trend_up = s.ema_fast > s.ema_slow
         confirm_trend_up = s.ema_confirm_fast > s.ema_confirm_slow
-        oversold = s.rsi < 38.0
-        overbought = s.rsi > 67.0
-        breakout_ready = s.breakout_bias >= -0.001 and s.rsi < 74.0
+        oversold = s.rsi < self.cfg.rsi_oversold
+        overbought = s.rsi > self.cfg.rsi_overbought
+        breakout_ready = s.breakout_bias >= -0.001 and s.rsi < self.cfg.rsi_breakout_max
         regime_ok = self.cfg.min_volatility <= s.volatility <= self.cfg.max_volatility
         confirm_strength_ok = s.confirm_trend_gap >= self.cfg.min_confirm_trend_gap
+        self._last_diag = {
+            "trend_up": int(trend_up),
+            "confirm_trend_up": int(confirm_trend_up),
+            "oversold": int(oversold),
+            "overbought": int(overbought),
+            "breakout_ready": int(breakout_ready),
+            "regime_ok": int(regime_ok),
+            "confirm_strength_ok": int(confirm_strength_ok),
+        }
 
         if self.position.base_qty <= 0:
             if self.bars_since_exit < self.cfg.cooldown_bars_after_exit:
                 return "hold", "cooldown"
-            if trend_up and confirm_trend_up and confirm_strength_ok and regime_ok and s.rsi < 62.0:
+            if trend_up and confirm_trend_up and confirm_strength_ok and regime_ok and s.rsi < self.cfg.rsi_trend_entry_max:
                 return "buy", "trend_continuation"
-            if oversold and confirm_trend_up and regime_ok and s.volatility < 0.02:
+            if oversold and confirm_trend_up and regime_ok and s.volatility < self.cfg.volatility_max_mean_reversion:
                 return "buy", "mean_reversion"
             if trend_up and confirm_trend_up and confirm_strength_ok and regime_ok and breakout_ready:
                 return "buy", "breakout_pullback"
@@ -387,7 +478,7 @@ class AdaptiveSpotBot:
         take_price = self.position.entry_price * (1.0 + self.cfg.target_take_profit_pct)
         trailing_floor = self.position.peak_price * (1.0 - self.cfg.trailing_stop_pct)
 
-        if s.volatility >= self.cfg.max_volatility * 1.5:
+        if s.volatility >= self.cfg.max_volatility * self.cfg.volatility_spike_multiplier:
             return "sell", "volatility_spike_protect"
         if s.last_price <= stop_price:
             return "sell", "hard_stop"
@@ -395,11 +486,44 @@ class AdaptiveSpotBot:
             return "sell", "trailing_stop"
         if s.last_price >= take_price and overbought:
             return "sell", "take_profit"
-        if not trend_up and s.rsi > 52.0:
+        if not trend_up and s.rsi > self.cfg.rsi_trend_exit_min:
             return "sell", "trend_lost"
         if not confirm_trend_up:
             return "sell", "higher_timeframe_lost"
         return "hold", "manage_open_position"
+
+    def _log_diagnostics(
+        self,
+        s: SignalSnapshot,
+        action: str,
+        reason: str,
+        diag: dict[str, float | int | str],
+    ):
+        row = [
+            dt.datetime.now(dt.timezone.utc).isoformat(),
+            self.cfg.symbol,
+            f"{s.last_price:.8f}",
+            f"{s.ema_fast:.8f}",
+            f"{s.ema_slow:.8f}",
+            f"{s.ema_confirm_fast:.8f}",
+            f"{s.ema_confirm_slow:.8f}",
+            f"{s.rsi:.4f}",
+            f"{s.volatility:.6f}",
+            f"{s.breakout_bias:.6f}",
+            f"{s.trend_gap:.6f}",
+            f"{s.confirm_trend_gap:.6f}",
+            str(diag.get("trend_up", "")),
+            str(diag.get("confirm_trend_up", "")),
+            str(diag.get("regime_ok", "")),
+            str(diag.get("confirm_strength_ok", "")),
+            str(diag.get("oversold", "")),
+            str(diag.get("overbought", "")),
+            str(diag.get("breakout_ready", "")),
+            action,
+            reason,
+        ]
+        with open(self.cfg.diagnostic_log_path, "a", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(row)
 
     async def _current_equity(self, mark_price: float) -> float:
         if self.cfg.dry_run:
