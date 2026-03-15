@@ -397,6 +397,92 @@ def _print_results(results: Iterable[BacktestResult]):
         )
 
 
+
+
+def _signals_hybrid_regime(
+    closes: Sequence[float],
+    fast_period: int,
+    slow_period: int,
+    rsi_entry: float,
+    rsi_exit: float,
+    breakout_lookback: int,
+) -> Tuple[List[bool], List[bool]]:
+    fast = _ema(closes, fast_period)
+    slow = _ema(closes, slow_period)
+    rsi = _rsi(closes, 14)
+    entries = [False] * len(closes)
+    exits = [False] * len(closes)
+
+    for i in range(len(closes)):
+        f = fast[i]
+        sl = slow[i]
+        rv = rsi[i]
+        if f is None or sl is None or rv is None:
+            continue
+
+        trend_up = f > sl
+        range_start = max(0, i - breakout_lookback + 1)
+        range_high = max(closes[range_start : i + 1])
+        near_high = closes[i] >= range_high * 0.998
+
+        entries[i] = trend_up and ((rv < rsi_entry) or near_high)
+        exits[i] = (not trend_up and rv > 50.0) or (rv > rsi_exit)
+
+    return entries, exits
+
+
+def optimize_hybrid_strategy(
+    candles: Sequence[Candle],
+    start_cash: float,
+    fee_rate: float,
+    slippage_rate: float,
+    periods_per_year: float,
+) -> BacktestResult:
+    closes = [c.close for c in candles]
+    fast_candidates = [8, 12, 20]
+    slow_candidates = [34, 55, 89]
+    rsi_entry_candidates = [32.0, 36.0, 40.0]
+    rsi_exit_candidates = [60.0, 65.0, 70.0]
+    breakout_lookback_candidates = [12, 20, 30]
+
+    best: BacktestResult | None = None
+    for fast in fast_candidates:
+        for slow in slow_candidates:
+            if fast >= slow:
+                continue
+            for rsi_entry in rsi_entry_candidates:
+                for rsi_exit in rsi_exit_candidates:
+                    if rsi_exit <= rsi_entry:
+                        continue
+                    for breakout_lookback in breakout_lookback_candidates:
+                        entries, exits = _signals_hybrid_regime(
+                            closes=closes,
+                            fast_period=fast,
+                            slow_period=slow,
+                            rsi_entry=rsi_entry,
+                            rsi_exit=rsi_exit,
+                            breakout_lookback=breakout_lookback,
+                        )
+                        result = run_backtest(
+                            name=(
+                                f"hybrid_opt_f{fast}_s{slow}_re{int(rsi_entry)}_rx{int(rsi_exit)}_b{breakout_lookback}"
+                            ),
+                            candles=candles,
+                            entries=entries,
+                            exits=exits,
+                            start_cash=start_cash,
+                            fee_rate=fee_rate,
+                            slippage_rate=slippage_rate,
+                            periods_per_year=periods_per_year,
+                        )
+                        if best is None or result.stability_score > best.stability_score:
+                            best = result
+
+    if best is None:
+        raise ValueError("Hybrid optimization failed to produce a result")
+    return best
+
+
 def main():
     parser = argparse.ArgumentParser(description="Backtest spot strategies on exchange OHLCV data")
     parser.add_argument("--exchange", default="kucoin", help="CCXT exchange id")
@@ -407,6 +493,7 @@ def main():
     parser.add_argument("--start-cash", type=float, default=1000.0, help="Starting balance in quote currency")
     parser.add_argument("--fee-rate", type=float, default=0.001, help="Fee per side as fraction")
     parser.add_argument("--slippage-rate", type=float, default=0.0002, help="Execution slippage per side")
+    parser.add_argument("--optimize-hybrid", action="store_true", help="Run parameter search for hybrid regime strategy")
     args = parser.parse_args()
 
     if not hasattr(ccxt, args.exchange):
@@ -445,6 +532,17 @@ def main():
                     candles=candles,
                     entries=entries,
                     exits=exits,
+                    start_cash=args.start_cash,
+                    fee_rate=args.fee_rate,
+                    slippage_rate=args.slippage_rate,
+                    periods_per_year=periods_per_year,
+                )
+            )
+
+        if args.optimize_hybrid:
+            results.append(
+                optimize_hybrid_strategy(
+                    candles=candles,
                     start_cash=args.start_cash,
                     fee_rate=args.fee_rate,
                     slippage_rate=args.slippage_rate,
