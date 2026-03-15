@@ -48,6 +48,7 @@ class BotConfig:
 
     symbol: str = os.getenv("SYMBOL", "BTC/USDT")
     timeframe: str = os.getenv("TIMEFRAME", "5m")
+    confirm_timeframe: str = os.getenv("CONFIRM_TIMEFRAME", "1h")
     lookback_bars: int = int(os.getenv("LOOKBACK_BARS", "200"))
 
     starting_capital_quote: float = float(os.getenv("STARTING_CAPITAL_QUOTE", "10"))
@@ -63,6 +64,9 @@ class BotConfig:
 
     max_equity_drawdown_pct: float = float(os.getenv("MAX_EQUITY_DRAWDOWN_PCT", "0.12"))
     max_consecutive_losses: int = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "4"))
+    min_volatility: float = float(os.getenv("MIN_VOLATILITY", "0.0015"))
+    max_volatility: float = float(os.getenv("MAX_VOLATILITY", "0.03"))
+    min_confirm_trend_gap: float = float(os.getenv("MIN_CONFIRM_TREND_GAP", "0.0005"))
 
     scan_interval_seconds: float = float(os.getenv("SCAN_INTERVAL_SECONDS", "20"))
     cooldown_bars_after_exit: int = int(os.getenv("COOLDOWN_BARS_AFTER_EXIT", "2"))
@@ -71,6 +75,8 @@ class BotConfig:
     health_check: bool = _env_bool("HEALTH_CHECK", "true")
 
     csv_log_path: str = os.getenv("CSV_LOG_PATH", "bot_log.csv")
+    log_every_n_scans: int = int(os.getenv("LOG_EVERY_N_SCANS", "0"))
+    log_every_seconds: float = float(os.getenv("LOG_EVERY_SECONDS", "0"))
 
 
 @dataclasses.dataclass
@@ -78,8 +84,13 @@ class SignalSnapshot:
     last_price: float
     ema_fast: float
     ema_slow: float
+    ema_confirm_fast: float
+    ema_confirm_slow: float
     rsi: float
     volatility: float
+    breakout_bias: float
+    trend_gap: float
+    confirm_trend_gap: float
 
 
 @dataclasses.dataclass
@@ -101,6 +112,10 @@ class AdaptiveSpotBot:
         self.consecutive_losses = 0
         self.bars_since_exit = cfg.cooldown_bars_after_exit
         self._running = True
+        self._scan_count = 0
+        self._last_snapshot: Optional[SignalSnapshot] = None
+        self._last_equity = cfg.starting_capital_quote
+        self._heartbeat_task: Optional[asyncio.Task] = None
 
         self.log_header = [
             "timestamp_utc",
@@ -128,6 +143,8 @@ class AdaptiveSpotBot:
             raise ValueError("COOLDOWN_BARS_AFTER_EXIT must be >= 0")
         if self.cfg.max_consecutive_losses < 1:
             raise ValueError("MAX_CONSECUTIVE_LOSSES must be >= 1")
+        if self.cfg.min_volatility < 0 or self.cfg.max_volatility <= self.cfg.min_volatility:
+            raise ValueError("Volatility bounds must satisfy 0 <= MIN_VOLATILITY < MAX_VOLATILITY")
 
     def _build_exchange(self):
         if not hasattr(ccxt, self.cfg.exchange_id):
@@ -149,6 +166,8 @@ class AdaptiveSpotBot:
             await self._health_check()
         else:
             await self.exchange.load_markets()
+        if self.cfg.log_every_seconds > 0:
+            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
 
     def _ensure_log_file(self):
         if os.path.exists(self.cfg.csv_log_path):
@@ -171,6 +190,16 @@ class AdaptiveSpotBot:
         except Exception as exc:
             print(f"[ERROR] load_markets failed: {exc}")
             raise
+
+    async def _heartbeat_loop(self):
+        while self._running:
+            await asyncio.sleep(self.cfg.log_every_seconds)
+            if not self._running:
+                break
+            snapshot = self._last_snapshot
+            if snapshot is None:
+                continue
+            self._log("hold", "heartbeat", snapshot.last_price, 0.0, 0.0, self._last_equity)
 
     async def run(self):
         loop = asyncio.get_event_loop()
@@ -198,6 +227,9 @@ class AdaptiveSpotBot:
     def stop(self):
         print("[INFO] Stop signal received")
         self._running = False
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
+            self._heartbeat_task = None
 
     async def scan_once(self):
         candles = await self.exchange.fetch_ohlcv(
@@ -205,13 +237,21 @@ class AdaptiveSpotBot:
             timeframe=self.cfg.timeframe,
             limit=max(self.cfg.lookback_bars, 80),
         )
+        confirm_candles = await self.exchange.fetch_ohlcv(
+            self.cfg.symbol,
+            timeframe=self.cfg.confirm_timeframe,
+            limit=120,
+        )
         if len(candles) < 60:
+            return
+        if len(confirm_candles) < 40:
             return
 
         closes = [_safe_float(row[4]) for row in candles]
         highs = [_safe_float(row[2]) for row in candles]
         lows = [_safe_float(row[3]) for row in candles]
-        signal_snapshot = self._build_signal(closes, highs, lows)
+        confirm_closes = [_safe_float(row[4]) for row in confirm_candles]
+        signal_snapshot = self._build_signal(closes, highs, lows, confirm_closes)
         self.bars_since_exit += 1
         if self.position.base_qty > 0:
             self.position.peak_price = max(self.position.peak_price, signal_snapshot.last_price)
@@ -226,6 +266,18 @@ class AdaptiveSpotBot:
         kill_switch_triggered = self._risk_guard(equity)
         if kill_switch_triggered and self.position.base_qty > 0:
             await self._exit_position(signal_snapshot.last_price, "kill_switch_exit")
+        self._scan_count += 1
+        self._last_snapshot = signal_snapshot
+        if kill_switch_triggered and self.position.base_qty > 0:
+            equity = await self._current_equity(signal_snapshot.last_price)
+        self._last_equity = equity
+        if (
+            action == "hold"
+            and not kill_switch_triggered
+            and self.cfg.log_every_n_scans > 0
+            and (self._scan_count % self.cfg.log_every_n_scans == 0)
+        ):
+            self._log("hold", reason, signal_snapshot.last_price, 0.0, 0.0, equity)
 
     @staticmethod
     def _ema(values: Sequence[float], period: int) -> list[Optional[float]]:
@@ -281,31 +333,62 @@ class AdaptiveSpotBot:
             return 0.0
         return (sum(true_ranges) / period) / mean_close
 
-    def _build_signal(self, closes: Sequence[float], highs: Sequence[float], lows: Sequence[float]) -> SignalSnapshot:
+    def _build_signal(
+        self,
+        closes: Sequence[float],
+        highs: Sequence[float],
+        lows: Sequence[float],
+        confirm_closes: Sequence[float],
+    ) -> SignalSnapshot:
         ema_fast = self._ema(closes, 12)[-1] or closes[-1]
         ema_slow = self._ema(closes, 34)[-1] or closes[-1]
+        ema_confirm_fast = self._ema(confirm_closes, 12)[-1] or confirm_closes[-1]
+        ema_confirm_slow = self._ema(confirm_closes, 34)[-1] or confirm_closes[-1]
         rsi = self._rsi(closes, 14)[-1] or 50.0
         vol = self._atr_like(closes, highs, lows, period=14)
-        return SignalSnapshot(last_price=closes[-1], ema_fast=ema_fast, ema_slow=ema_slow, rsi=rsi, volatility=vol)
+        range_high = max(closes[-20:]) if len(closes) >= 20 else max(closes)
+        breakout_bias = (closes[-1] / range_high) - 1.0 if range_high > 0 else 0.0
+        trend_gap = ((ema_fast / ema_slow) - 1.0) if ema_slow > 0 else 0.0
+        confirm_trend_gap = ((ema_confirm_fast / ema_confirm_slow) - 1.0) if ema_confirm_slow > 0 else 0.0
+        return SignalSnapshot(
+            last_price=closes[-1],
+            ema_fast=ema_fast,
+            ema_slow=ema_slow,
+            ema_confirm_fast=ema_confirm_fast,
+            ema_confirm_slow=ema_confirm_slow,
+            rsi=rsi,
+            volatility=vol,
+            breakout_bias=breakout_bias,
+            trend_gap=trend_gap,
+            confirm_trend_gap=confirm_trend_gap,
+        )
 
     def _decide(self, s: SignalSnapshot) -> tuple[str, str]:
         trend_up = s.ema_fast > s.ema_slow
+        confirm_trend_up = s.ema_confirm_fast > s.ema_confirm_slow
         oversold = s.rsi < 38.0
         overbought = s.rsi > 67.0
+        breakout_ready = s.breakout_bias >= -0.001 and s.rsi < 74.0
+        regime_ok = self.cfg.min_volatility <= s.volatility <= self.cfg.max_volatility
+        confirm_strength_ok = s.confirm_trend_gap >= self.cfg.min_confirm_trend_gap
 
         if self.position.base_qty <= 0:
             if self.bars_since_exit < self.cfg.cooldown_bars_after_exit:
                 return "hold", "cooldown"
-            if trend_up and s.rsi < 62.0:
+            if trend_up and confirm_trend_up and confirm_strength_ok and regime_ok and s.rsi < 62.0:
                 return "buy", "trend_continuation"
-            if oversold and s.volatility < 0.02:
+            if oversold and confirm_trend_up and regime_ok and s.volatility < 0.02:
                 return "buy", "mean_reversion"
+            if trend_up and confirm_trend_up and confirm_strength_ok and regime_ok and breakout_ready:
+                return "buy", "breakout_pullback"
             return "hold", "no_entry"
 
         stop_price = self.position.entry_price * (1.0 - self.cfg.stop_loss_pct)
         take_price = self.position.entry_price * (1.0 + self.cfg.target_take_profit_pct)
         trailing_floor = self.position.peak_price * (1.0 - self.cfg.trailing_stop_pct)
 
+        if s.volatility >= self.cfg.max_volatility * 1.5:
+            return "sell", "volatility_spike_protect"
         if s.last_price <= stop_price:
             return "sell", "hard_stop"
         if s.last_price <= trailing_floor and self.position.peak_price > self.position.entry_price:
@@ -314,6 +397,8 @@ class AdaptiveSpotBot:
             return "sell", "take_profit"
         if not trend_up and s.rsi > 52.0:
             return "sell", "trend_lost"
+        if not confirm_trend_up:
+            return "sell", "higher_timeframe_lost"
         return "hold", "manage_open_position"
 
     async def _current_equity(self, mark_price: float) -> float:
@@ -459,6 +544,15 @@ class AdaptiveSpotBot:
         with open(self.cfg.csv_log_path, "a", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow(row)
 
+    async def shutdown(self):
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
+            try:
+                await self._heartbeat_task
+            except asyncio.CancelledError:
+                pass
+            self._heartbeat_task = None
+
 
 async def main():
     cfg = BotConfig()
@@ -467,6 +561,7 @@ async def main():
         await bot.initialize()
         await bot.run()
     finally:
+        await bot.shutdown()
         await bot.exchange.close()
 
 
