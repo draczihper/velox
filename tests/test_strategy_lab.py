@@ -9,6 +9,7 @@ from strategy_lab import (
     _signals_rsi_mean_reversion,
     _timeframe_seconds,
     run_backtest,
+    walk_forward_evaluate,
 )
 
 
@@ -70,3 +71,55 @@ def test_rsi_reversion_triggers_after_drop():
     closes = [100.0] * 40 + [95.0, 92.0, 89.0, 87.0, 90.0, 92.0, 94.0]
     entries, exits = _signals_rsi_mean_reversion(closes)
     assert any(entries)
+
+
+def test_walk_forward_returns_consistency_metrics():
+    closes = [100 + i for i in range(120)]
+    candles = _make_candles(closes)
+    entries = [False] * len(candles)
+    exits = [False] * len(candles)
+    for i in range(0, len(candles), 40):
+        if i + 1 < len(candles):
+            entries[i + 1] = True
+        if i + 39 < len(candles):
+            exits[i + 39] = True
+
+    wf = walk_forward_evaluate(
+        strategy="unit",
+        candles=candles,
+        entries=entries,
+        exits=exits,
+        split_bars=40,
+        start_cash=1000.0,
+        fee_rate=0.0,
+        slippage_rate=0.0,
+        periods_per_year=365.0,
+    )
+
+    assert wf.splits == 3
+    assert wf.consistency_pct == 100.0
+    assert wf.median_return_pct > 0
+
+
+def test_walk_forward_requires_aligned_lengths():
+    candles = _make_candles([100 + i for i in range(60)])
+    entries = [False] * 59
+    exits = [False] * 60
+
+    try:
+        walk_forward_evaluate(
+            strategy="unit",
+            candles=candles,
+            entries=entries,
+            exits=exits,
+            split_bars=30,
+            start_cash=1000.0,
+            fee_rate=0.001,
+            slippage_rate=0.0,
+            periods_per_year=365.0,
+        )
+        raised = False
+    except ValueError:
+        raised = True
+
+    assert raised
