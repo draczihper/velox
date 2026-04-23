@@ -49,6 +49,17 @@ class BacktestResult:
     stability_score: float
 
 
+@dataclasses.dataclass(frozen=True)
+class WalkForwardResult:
+    strategy: str
+    splits: int
+    split_bars: int
+    median_return_pct: float
+    worst_return_pct: float
+    median_drawdown_pct: float
+    consistency_pct: float
+
+
 def _timeframe_seconds(timeframe: str) -> int:
     timeframe = timeframe.strip().lower()
     if len(timeframe) < 2:
@@ -397,6 +408,90 @@ def _print_results(results: Iterable[BacktestResult]):
         )
 
 
+def walk_forward_evaluate(
+    strategy: str,
+    candles: Sequence[Candle],
+    entries: Sequence[bool],
+    exits: Sequence[bool],
+    split_bars: int,
+    start_cash: float,
+    fee_rate: float,
+    slippage_rate: float,
+    periods_per_year: float,
+) -> WalkForwardResult:
+    if split_bars <= 0:
+        raise ValueError("split_bars must be > 0")
+    if len(candles) != len(entries) or len(candles) != len(exits):
+        raise ValueError("candles, entries, and exits must have equal length")
+
+    split_results: List[BacktestResult] = []
+    for start in range(0, len(candles), split_bars):
+        end = min(start + split_bars, len(candles))
+        if end - start < 30:
+            continue
+        split_results.append(
+            run_backtest(
+                name=strategy,
+                candles=candles[start:end],
+                entries=entries[start:end],
+                exits=exits[start:end],
+                start_cash=start_cash,
+                fee_rate=fee_rate,
+                slippage_rate=slippage_rate,
+                periods_per_year=periods_per_year,
+            )
+        )
+
+    if not split_results:
+        return WalkForwardResult(
+            strategy=strategy,
+            splits=0,
+            split_bars=split_bars,
+            median_return_pct=0.0,
+            worst_return_pct=0.0,
+            median_drawdown_pct=0.0,
+            consistency_pct=0.0,
+        )
+
+    returns = [r.total_return_pct for r in split_results]
+    drawdowns = [r.max_drawdown_pct for r in split_results]
+    non_negative = sum(1 for r in returns if r >= 0.0)
+    return WalkForwardResult(
+        strategy=strategy,
+        splits=len(split_results),
+        split_bars=split_bars,
+        median_return_pct=statistics.median(returns),
+        worst_return_pct=min(returns),
+        median_drawdown_pct=statistics.median(drawdowns),
+        consistency_pct=(non_negative / len(split_results)) * 100.0,
+    )
+
+
+def _print_walk_forward(results: Iterable[WalkForwardResult]):
+    header = (
+        f"{'strategy':<24}"
+        f"{'splits':>8}"
+        f"{'bars':>8}"
+        f"{'med_ret%':>12}"
+        f"{'worst%':>10}"
+        f"{'med_dd%':>10}"
+        f"{'consist%':>11}"
+    )
+    print("\nWalk-forward stability")
+    print(header)
+    print("-" * len(header))
+    for r in results:
+        print(
+            f"{r.strategy:<24}"
+            f"{r.splits:>8d}"
+            f"{r.split_bars:>8d}"
+            f"{r.median_return_pct:>12.2f}"
+            f"{r.worst_return_pct:>10.2f}"
+            f"{r.median_drawdown_pct:>10.2f}"
+            f"{r.consistency_pct:>11.2f}"
+        )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Backtest spot strategies on exchange OHLCV data")
     parser.add_argument("--exchange", default="binance", help="CCXT exchange id")
@@ -407,6 +502,12 @@ def main():
     parser.add_argument("--start-cash", type=float, default=1000.0, help="Starting balance in quote currency")
     parser.add_argument("--fee-rate", type=float, default=0.001, help="Fee per side as fraction")
     parser.add_argument("--slippage-rate", type=float, default=0.0002, help="Execution slippage per side")
+    parser.add_argument(
+        "--walk-forward-bars",
+        type=int,
+        default=0,
+        help="Optional walk-forward split size in bars (e.g. 288 for ~3 days on 15m)",
+    )
     args = parser.parse_args()
 
     if not hasattr(ccxt, args.exchange):
@@ -458,6 +559,25 @@ def main():
             f"Candles={len(candles)}"
         )
         _print_results(results)
+
+        if args.walk_forward_bars > 0:
+            wf_results = []
+            for name, (entries, exits) in strategy_defs:
+                wf_results.append(
+                    walk_forward_evaluate(
+                        strategy=name,
+                        candles=candles,
+                        entries=entries,
+                        exits=exits,
+                        split_bars=args.walk_forward_bars,
+                        start_cash=args.start_cash,
+                        fee_rate=args.fee_rate,
+                        slippage_rate=args.slippage_rate,
+                        periods_per_year=periods_per_year,
+                    )
+                )
+            wf_results.sort(key=lambda x: x.consistency_pct, reverse=True)
+            _print_walk_forward(wf_results)
     finally:
         try:
             exchange.close()
